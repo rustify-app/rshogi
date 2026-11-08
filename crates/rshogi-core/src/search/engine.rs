@@ -1041,6 +1041,25 @@ impl Search {
         );
     }
 
+    /// メインスレッドの探索 worker を、まだ無ければ作る。
+    ///
+    /// worker は大きな履歴表を持ち、確保と初回書込みに数秒かかることがある。`go` の中で
+    /// 作ると時間計測の開始後になり 1 手目の持ち時間を食うので、待機中 (USI の `isready`)
+    /// に呼んでおく。作成済みなら何もしない。
+    pub fn prepare_worker(&mut self) {
+        if self.worker.is_some() {
+            return;
+        }
+        self.worker = Some(SearchWorker::new_with_shared(
+            Arc::clone(&self.tt),
+            Arc::clone(&self.eval_hash),
+            Arc::clone(&self.shared_histories),
+            self.max_moves_to_draw,
+            0,
+            self.search_tune_params,
+        ));
+    }
+
     /// 探索スレッド数を取得
     pub fn num_threads(&self) -> usize {
         self.num_threads
@@ -1127,24 +1146,11 @@ impl Search {
         // ply（現在の手数）は局面から取得、max_moves_to_drawはデフォルトを使う
         time_manager.init(&limits, pos.side_to_move(), ply, self.max_moves_to_draw);
 
-        // workerは遅延初期化、再利用する
-        let tt_clone = Arc::clone(&self.tt);
-        let eval_hash_clone = Arc::clone(&self.eval_hash);
-        let max_moves = self.max_moves_to_draw;
-        let search_tune_params = self.search_tune_params;
+        // worker は prepare_worker で事前に作っておくのが前提。未作成ならここで作る。
+        self.prepare_worker();
         let draw_value_black = self.draw_value_black;
         let draw_value_white = self.draw_value_white;
-        let shared_histories = Arc::clone(&self.shared_histories);
-        let worker = self.worker.get_or_insert_with(|| {
-            SearchWorker::new_with_shared(
-                tt_clone,
-                eval_hash_clone,
-                shared_histories,
-                max_moves,
-                0,
-                search_tune_params,
-            )
-        });
+        let worker = self.worker.as_mut().expect("prepare_worker creates the main worker");
 
         // setoptionで変更された可能性があるため、最新値を反映
         worker.max_moves_to_draw = self.max_moves_to_draw;
