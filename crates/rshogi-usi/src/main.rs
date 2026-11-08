@@ -527,6 +527,13 @@ impl UsiEngine {
                 routing_bucket_count
             );
         }
+        // EvalHash の確保と探索 worker の作成は時間がかかるので、go の時間計測の前に済ませる。
+        if let Some(search) = self.search.as_mut() {
+            if search.eval_hash_size_mb() != self.eval_hash_size_mb {
+                search.resize_eval_hash(self.eval_hash_size_mb);
+            }
+            search.prepare_worker();
+        }
         self.maybe_report_page_status();
         self.maybe_load_book();
         self.maybe_load_book_explore();
