@@ -159,6 +159,30 @@ impl<const L1: usize> AccCacheEntry<L1> {
 pub struct AccumulatorCacheLayerStacks<const L1: usize> {
     /// [king_sq][perspective] のキャッシュエントリ
     entries: Box<[[AccCacheEntry<L1>; 2]; Square::NUM]>,
+    /// Threat accumulator のキャッシュ `[perspective][hm_mirror]`
+    #[cfg(feature = "nnue-threat")]
+    threat_entries: Box<[[ThreatCacheEntry<L1>; 2]; 2]>,
+}
+
+/// Threat accumulator を作ったときの有効 index 列の上限。
+///
+/// 超えた局面はキャッシュを使わず全列挙する。
+#[cfg(feature = "nnue-threat")]
+pub const MAX_CACHED_THREAT_INDICES: usize = 512;
+
+/// Threat accumulator のキャッシュエントリ
+///
+/// Threat 特徴量は玉位置に HM mirror を通してしか依存しないので、
+/// `[perspective][hm_mirror]` の 4 エントリで足りる。accumulator は有効 index の
+/// 集合だけで決まるため、前回の集合との差分だけを足し引きすればよい。
+#[cfg(feature = "nnue-threat")]
+pub struct ThreatCacheEntry<const L1: usize> {
+    /// `indices[..len]` を全部足した accumulator
+    pub accumulation: [i16; L1],
+    /// 昇順の有効 index
+    pub indices: [u32; MAX_CACHED_THREAT_INDICES],
+    pub len: usize,
+    pub valid: bool,
 }
 
 impl<const L1: usize> AccumulatorCacheLayerStacks<L1> {
@@ -173,7 +197,18 @@ impl<const L1: usize> AccumulatorCacheLayerStacks<L1> {
         // SAFETY: Square::NUM == 81 なので配列サイズと一致する
         let ptr = Box::into_raw(boxed) as *mut [[AccCacheEntry<L1>; 2]; Square::NUM];
         let entries = unsafe { Box::from_raw(ptr) };
-        Self { entries }
+        Self {
+            entries,
+            #[cfg(feature = "nnue-threat")]
+            threat_entries: Box::new(std::array::from_fn(|_| {
+                std::array::from_fn(|_| ThreatCacheEntry {
+                    accumulation: [0; L1],
+                    indices: [0; MAX_CACHED_THREAT_INDICES],
+                    len: 0,
+                    valid: false,
+                })
+            })),
+        }
     }
 
     /// 全エントリを無効化
@@ -183,6 +218,20 @@ impl<const L1: usize> AccumulatorCacheLayerStacks<L1> {
                 entry.valid = false;
             }
         }
+        #[cfg(feature = "nnue-threat")]
+        for entry in self.threat_entries.iter_mut().flatten() {
+            entry.valid = false;
+        }
+    }
+
+    /// Threat キャッシュエントリ
+    #[cfg(feature = "nnue-threat")]
+    pub(crate) fn threat_entry_mut(
+        &mut self,
+        perspective: Color,
+        hm_mirror: bool,
+    ) -> &mut ThreatCacheEntry<L1> {
+        &mut self.threat_entries[perspective as usize][usize::from(hm_mirror)]
     }
 
     /// bias/cache の tile を差分更新し、cache と探索 stack へ同時に書く。

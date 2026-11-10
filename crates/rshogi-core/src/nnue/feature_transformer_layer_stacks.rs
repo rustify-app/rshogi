@@ -1037,16 +1037,7 @@ impl<const L1: usize, FT: LsFeatureSpec> FeatureTransformerLayerStacks<L1, FT> {
                 let reset_threat =
                     threat_features::needs_threat_refresh(dirty_piece, king_sq, perspective);
                 if reset_threat {
-                    let threat_acc = acc.get_threat_mut(p);
-                    threat_acc.fill(0);
-                    threat_features::for_each_active_threat_index(
-                        pos,
-                        perspective,
-                        king_sq,
-                        |idx| {
-                            self.add_threat_weights(threat_acc, idx);
-                        },
-                    );
+                    self.refresh_threat_with_cache(pos, perspective, acc.get_threat_mut(p), cache);
                 } else {
                     let prev_threat = prev_acc.get_threat(p);
                     let curr_threat = acc.get_threat_mut(p);
@@ -1120,21 +1111,124 @@ impl<const L1: usize, FT: LsFeatureSpec> FeatureTransformerLayerStacks<L1, FT> {
             {
                 self.refresh_perspective_with_cache(pos, perspective, acc.get_mut(p), cache);
             }
+        }
 
-            // Threat はキャッシュ非対象なのでフル再計算
-            #[cfg(feature = "nnue-threat")]
-            if self.has_threat {
-                let king_sq = pos.king_square(perspective);
-                let threat_acc = acc.get_threat_mut(p);
-                threat_acc.fill(0);
-                threat_features::for_each_active_threat_index(pos, perspective, king_sq, |idx| {
-                    self.add_threat_weights(threat_acc, idx);
-                });
+        #[cfg(feature = "nnue-threat")]
+        if self.has_threat {
+            use super::accumulator_layer_stacks::MAX_CACHED_THREAT_INDICES;
+            let mut lists = [[0u32; MAX_CACHED_THREAT_INDICES]; 2];
+            let mut lens = [0usize; 2];
+            threat_features::for_each_active_threat_index_both(pos, |perspective, idx| {
+                let p = perspective as usize;
+                // 上限を超えた分は数えるだけにし、後で全列挙に切り替える
+                if lens[p] < MAX_CACHED_THREAT_INDICES {
+                    lists[p][lens[p]] = idx as u32;
+                }
+                lens[p] += 1;
+            });
+            for perspective in [Color::Black, Color::White] {
+                let p = perspective as usize;
+                let current =
+                    (lens[p] <= MAX_CACHED_THREAT_INDICES).then(|| &mut lists[p][..lens[p]]);
+                self.apply_threat_indices_with_cache(
+                    pos,
+                    perspective,
+                    current,
+                    acc.get_threat_mut(p),
+                    cache,
+                );
             }
         }
 
         acc.computed_accumulation = true;
         acc.computed_score = false;
+    }
+
+    /// Threat accumulator をキャッシュ経由で作り直す
+    ///
+    /// 現局面の有効 index を昇順に並べ、同じ `[perspective][hm_mirror]` で前回作った
+    /// accumulator との差分だけを足し引きする。差分が有効 index 数より多いとき
+    /// (局面が大きく変わったとき) は 0 から足し直す。
+    #[cfg(feature = "nnue-threat")]
+    fn refresh_threat_with_cache(
+        &self,
+        pos: &Position,
+        perspective: Color,
+        threat_acc: &mut [i16; L1],
+        cache: &mut AccumulatorCacheLayerStacks<L1>,
+    ) {
+        use super::accumulator_layer_stacks::MAX_CACHED_THREAT_INDICES;
+
+        let king_sq = pos.king_square(perspective);
+        let mut current = [0u32; MAX_CACHED_THREAT_INDICES];
+        let mut len = 0;
+        threat_features::for_each_active_threat_index(pos, perspective, king_sq, |idx| {
+            if len < MAX_CACHED_THREAT_INDICES {
+                current[len] = idx as u32;
+            }
+            len += 1;
+        });
+        let current = (len <= MAX_CACHED_THREAT_INDICES).then(|| &mut current[..len]);
+        self.apply_threat_indices_with_cache(pos, perspective, current, threat_acc, cache);
+    }
+
+    /// 有効 index 列 `current` (未整列) から Threat accumulator を作り、キャッシュを更新する
+    ///
+    /// `current` が `None` (index が上限を超えた) なら全列挙で作り、キャッシュは使わない。
+    #[cfg(feature = "nnue-threat")]
+    fn apply_threat_indices_with_cache(
+        &self,
+        pos: &Position,
+        perspective: Color,
+        current: Option<&mut [u32]>,
+        threat_acc: &mut [i16; L1],
+        cache: &mut AccumulatorCacheLayerStacks<L1>,
+    ) {
+        let king_sq = pos.king_square(perspective);
+        let hm = super::bona_piece_halfka_hm_merged::is_hm_mirror(king_sq, perspective);
+        let entry = cache.threat_entry_mut(perspective, hm);
+        let Some(current) = current else {
+            entry.valid = false;
+            threat_acc.fill(0);
+            threat_features::for_each_active_threat_index(pos, perspective, king_sq, |idx| {
+                self.add_threat_weights(threat_acc, idx);
+            });
+            return;
+        };
+        let len = current.len();
+        current.sort_unstable();
+
+        let cached = &entry.indices[..entry.len];
+        let diff = if entry.valid {
+            sorted_diff_count(cached, current)
+        } else {
+            usize::MAX
+        };
+        if diff < len {
+            threat_acc.copy_from_slice(&entry.accumulation);
+            let (mut i, mut j) = (0, 0);
+            while i < cached.len() || j < current.len() {
+                if j == current.len() || (i < cached.len() && cached[i] < current[j]) {
+                    self.sub_threat_weights(threat_acc, cached[i] as usize);
+                    i += 1;
+                } else if i == cached.len() || current[j] < cached[i] {
+                    self.add_threat_weights(threat_acc, current[j] as usize);
+                    j += 1;
+                } else {
+                    i += 1;
+                    j += 1;
+                }
+            }
+        } else {
+            threat_acc.fill(0);
+            for &idx in current.iter() {
+                self.add_threat_weights(threat_acc, idx as usize);
+            }
+        }
+        entry.accumulation.copy_from_slice(threat_acc);
+        entry.indices[..len].copy_from_slice(current);
+        entry.len = len;
+        entry.valid = true;
     }
 
     /// 単一視点のキャッシュ経由 refresh (piece_list 差分方式)
@@ -2231,6 +2325,29 @@ impl<const L1: usize, FT: LsFeatureSpec> FeatureTransformerLayerStacks<L1, FT> {
     }
 }
 
+/// 昇順の 2 列の対称差の要素数
+#[cfg(feature = "nnue-threat")]
+fn sorted_diff_count(a: &[u32], b: &[u32]) -> usize {
+    let (mut i, mut j, mut diff) = (0, 0, 0);
+    while i < a.len() && j < b.len() {
+        match a[i].cmp(&b[j]) {
+            std::cmp::Ordering::Less => {
+                diff += 1;
+                i += 1;
+            }
+            std::cmp::Ordering::Greater => {
+                diff += 1;
+                j += 1;
+            }
+            std::cmp::Ordering::Equal => {
+                i += 1;
+                j += 1;
+            }
+        }
+    }
+    diff + (a.len() - i) + (b.len() - j)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2943,6 +3060,66 @@ mod tests {
     #[test]
     fn refresh_biases_halfkp() {
         refresh_biases_for_spec::<HalfKpSpec>();
+    }
+
+    /// Threat accumulator をキャッシュ経由で作り直した結果が、全列挙と一致することを確かめる。
+    /// キャッシュを残したまま合法手をランダムにたどり、玉の HM mirror 跨ぎも含めて検証する。
+    #[cfg(all(feature = "nnue-threat", not(feature = "nnue-effect-bucket")))]
+    #[test]
+    fn refresh_threat_with_cache_matches_full_enumeration() {
+        use crate::movegen::{MoveList, generate_legal};
+        use crate::position::SFEN_HIRATE;
+        use rand::{RngCore, SeedableRng};
+        use rand_xoshiro::Xoshiro256PlusPlus;
+
+        const L1: usize = 32;
+        let mut threat_weights = AlignedBox::<i8>::new_zeroed(THREAT_DIMENSIONS * L1);
+        for (i, w) in threat_weights.iter_mut().enumerate() {
+            *w = ((i as u32).wrapping_mul(2_654_435_761) >> 24) as i8;
+        }
+        let ft = FeatureTransformerLayerStacks::<L1, TestSpec> {
+            biases: Aligned([0; L1]),
+            weights: AlignedBox::<i16>::new_zeroed(TestSpec::DIMENSIONS * L1).into(),
+            #[cfg(feature = "nnue-psqt")]
+            psqt_biases: [0; MAX_LAYER_STACK_BUCKETS],
+            #[cfg(feature = "nnue-psqt")]
+            psqt_num_buckets: 0,
+            #[cfg(feature = "nnue-psqt")]
+            psqt_weights: AlignedBox::new_zeroed(0).into(),
+            #[cfg(feature = "nnue-psqt")]
+            has_psqt: false,
+            threat_weights: threat_weights.into(),
+            has_threat: true,
+            _ft: PhantomData,
+        };
+
+        let mut rng = Xoshiro256PlusPlus::seed_from_u64(0x7417_ca5e);
+        let mut cache = AccumulatorCacheLayerStacks::<L1>::new();
+        let mut pos = Position::new();
+        for sfen in [SFEN_HIRATE, "4k4/9/9/9/9/9/9/9/4K4 b R2Pbr 1", SFEN_HIRATE] {
+            pos.set_sfen(sfen).unwrap();
+            for step in 0..150 {
+                let mut slow = AccumulatorLayerStacks::<L1>::new();
+                ft.refresh_accumulator(&pos, &mut slow);
+                let mut cached = AccumulatorLayerStacks::<L1>::new();
+                ft.refresh_accumulator_with_cache(&pos, &mut cached, &mut cache);
+                for p in 0..2 {
+                    assert_eq!(
+                        slow.get_threat(p),
+                        cached.get_threat(p),
+                        "sfen {sfen} step {step} perspective {p}"
+                    );
+                }
+                let mut moves = MoveList::new();
+                generate_legal(&pos, &mut moves);
+                if moves.is_empty() {
+                    break;
+                }
+                let mv = *moves.iter().nth(rng.next_u32() as usize % moves.len()).unwrap();
+                let gives_check = pos.gives_check(mv);
+                pos.do_move(mv, gives_check);
+            }
+        }
     }
 
     /// HalfKp で `refresh_accumulator` (slow path) と `refresh_accumulator_with_cache`

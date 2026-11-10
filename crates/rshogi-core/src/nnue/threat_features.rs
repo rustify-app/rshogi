@@ -825,6 +825,93 @@ fn is_occupied_independent_threat(pt: PieceType) -> bool {
 // for_each_active_threat_index（ヒープ不要のコールバック版）
 // =============================================================================
 
+/// 被攻撃駒の候補を絞る。cross-side profile は敵味方を跨ぐ pair しか使わないので、
+/// 攻撃側と同じ色の駒は調べない。
+#[cfg(feature = "nnue-threat")]
+#[inline]
+fn threat_targets(pos: &Position, attacker_color: Color, attack_bb: Bitboard) -> Bitboard {
+    if cfg!(feature = "threat-profile-cross-side") {
+        attack_bb & pos.pieces_c(!attacker_color)
+    } else {
+        attack_bb & pos.occupied()
+    }
+}
+
+/// 現局面の全 threat pair を 1 回だけ列挙し、先手視点・後手視点それぞれの index を
+/// `f(perspective, index)` に渡す。
+///
+/// 除外規則は攻撃側・被攻撃側が同じ陣営か (視点で入れ替わっても一致は変わらない) と
+/// 駒種だけで決まるので、両視点で同じ pair が残る。利きの計算を視点ごとに繰り返さない分、
+/// `for_each_active_threat_index` を 2 回呼ぶより速い。
+#[cfg(feature = "nnue-threat")]
+#[inline]
+pub fn for_each_active_threat_index_both<F: FnMut(Color, usize)>(pos: &Position, mut f: F) {
+    count_threat_full!();
+    count_threat_full!();
+    let occupied = pos.occupied();
+    let from_offset_table = &*FROM_OFFSET_TABLE;
+    let hm = [
+        is_hm_mirror(pos.king_square(Color::Black), Color::Black),
+        is_hm_mirror(pos.king_square(Color::White), Color::White),
+    ];
+
+    for attacker_color in [Color::Black, Color::White] {
+        let mut attacker_bb = pos.pieces_c(attacker_color);
+        while !attacker_bb.is_empty() {
+            let from_sq = attacker_bb.pop();
+            let pt = pos.piece_on(from_sq).piece_type();
+
+            let Some(attacker_class) = ThreatClass::from_piece_type(pt) else {
+                continue;
+            };
+
+            let attack_bb = attacks_from_piece(pt, attacker_color, from_sq, occupied);
+            let mut targets = threat_targets(pos, attacker_color, attack_bb);
+            while !targets.is_empty() {
+                let to_sq = targets.pop();
+                let target_pc = pos.piece_on(to_sq);
+
+                let Some(attacked_class) = ThreatClass::from_piece_type(target_pc.piece_type())
+                else {
+                    continue;
+                };
+
+                let target_color = target_pc.color();
+
+                #[cfg(feature = "threat-profile-full-symdedup")]
+                if is_canonical_dead(attacker_class, from_sq, attacked_class, target_color, to_sq) {
+                    continue;
+                }
+
+                for perspective in [Color::Black, Color::White] {
+                    let attacker_side = usize::from(attacker_color != perspective);
+                    let attacked_side = usize::from(target_color != perspective);
+                    let p_hm = hm[perspective as usize];
+                    let oriented_color = if perspective == Color::Black {
+                        attacker_color
+                    } else {
+                        !attacker_color
+                    };
+                    let Some(idx) = threat_index(
+                        attacker_side,
+                        attacker_class,
+                        oriented_color,
+                        attacked_side,
+                        attacked_class,
+                        normalize_sq(from_sq, perspective, p_hm),
+                        normalize_sq(to_sq, perspective, p_hm),
+                        from_offset_table,
+                    ) else {
+                        continue; // excluded pair
+                    };
+                    debug_assert!(idx < THREAT_DIMENSIONS);
+                    f(perspective, idx);
+                }
+            }
+        }
+    }
+}
+
 /// 現局面の全 threat pair を列挙し、コールバック `f` に index を渡す。
 ///
 /// `append_active_threat_indices` と同一ロジックだが、Vec 不要でホットパスで使用可能。
@@ -856,7 +943,7 @@ pub fn for_each_active_threat_index<F: FnMut(usize)>(
             };
 
             let attack_bb = attacks_from_piece(pt, attacker_color, from_sq, occupied);
-            let mut targets = attack_bb & occupied;
+            let mut targets = threat_targets(pos, attacker_color, attack_bb);
             while !targets.is_empty() {
                 let to_sq = targets.pop();
                 let target_pc = pos.piece_on(to_sq);
