@@ -699,6 +699,39 @@ impl<
         f(us, them)
     }
 
+    /// 両視点の累積値 (Threat 有効時は合成後) に SqrClippedReLU を適用する。
+    ///
+    /// AVX2 で Threat が有効なときは、合成済みの一時配列を作らずに変換する。
+    #[inline]
+    fn transform_accumulators(
+        &self,
+        acc: &AccumulatorLayerStacks<L1>,
+        side_to_move: Color,
+    ) -> Aligned<[u8; L1]> {
+        #[cfg(all(
+            feature = "nnue-threat",
+            target_arch = "x86_64",
+            target_feature = "avx2",
+            not(all(target_feature = "avx512f", target_feature = "avx512bw"))
+        ))]
+        if self.feature_transformer.has_threat {
+            let (us, them) = if side_to_move == Color::Black {
+                (0, 1)
+            } else {
+                (1, 0)
+            };
+            return super::layer_stacks::sqr_clipped_relu_new_with_threat(
+                acc.get(us),
+                acc.get_threat(us),
+                acc.get(them),
+                acc.get_threat(them),
+            );
+        }
+        self.with_combined_accumulators(acc, side_to_move, |us, them| {
+            sqr_clipped_relu_new(us, them)
+        })
+    }
+
     /// forward と同じ因子・入力から活性飽和数を計測する。
     ///
     /// 戻り値は両視点の FT 因子が 127 以上となる数（総数は 2 * L1）。
@@ -753,9 +786,7 @@ impl<
             target_feature = "avx512vnni"
         )))]
         let raw_score = {
-            let transformed = self.with_combined_accumulators(acc, side_to_move, |us, them| {
-                sqr_clipped_relu_new(us, them)
-            });
+            let transformed = self.transform_accumulators(acc, side_to_move);
             self.layer_stacks.evaluate_raw(bucket_index, &transformed.0)
         };
 

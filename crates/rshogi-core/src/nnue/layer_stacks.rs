@@ -772,6 +772,69 @@ pub(crate) fn sqr_clipped_relu_new<const L1: usize>(
     }
 }
 
+/// 駒と Threat の累積値を i16 の wrapping 和で合成しながら SqrClippedReLU を適用する (AVX2)。
+///
+/// 合成済みの一時配列を作らず、読み込んだレジスタ上で足してから変換する。
+/// 結果は `add_i16_arrays` で合成してから [`sqr_clipped_relu_new`] を呼んだ場合と一致する。
+#[cfg(all(
+    feature = "nnue-threat",
+    target_arch = "x86_64",
+    target_feature = "avx2",
+    not(all(target_feature = "avx512f", target_feature = "avx512bw"))
+))]
+pub(crate) fn sqr_clipped_relu_new_with_threat<const L1: usize>(
+    us_acc: &[i16; L1],
+    us_threat: &[i16; L1],
+    them_acc: &[i16; L1],
+    them_threat: &[i16; L1],
+) -> Aligned<[u8; L1]> {
+    const { assert!(L1.is_multiple_of(64)) };
+    let half = L1 / 2;
+    let mut output = std::mem::MaybeUninit::<Aligned<[u8; L1]>>::uninit();
+    // SAFETY:
+    // - 4 つの入力はそれぞれ L1 要素。unaligned load のためアライメント不要。
+    // - 各視点で half/32 個の 32 要素ブロックを処理し、入力・出力 (L1 バイト) の範囲外へアクセスしない。
+    // - 出力は raw pointer にだけ書き込み、未初期化の配列への参照は作らない。両視点の
+    //   half 要素ずつ (計 L1) を余りなく書くので、assume_init 時点で全 u8 が有効。
+    // - 乗算結果は max 127*127=16129 < i16::MAX、>>7 後は [0, 126] で packus に収まる。
+    unsafe {
+        use std::arch::x86_64::*;
+        let out_base = output.as_mut_ptr().cast::<u8>();
+        let zero = _mm256_setzero_si256();
+        let max127 = _mm256_set1_epi16(127);
+        let load = |p: *const i16, t: *const i16, o: usize| {
+            _mm256_add_epi16(
+                _mm256_loadu_si256(p.add(o) as *const __m256i),
+                _mm256_loadu_si256(t.add(o) as *const __m256i),
+            )
+        };
+        for (acc, thr, out_offset) in [
+            (us_acc.as_ptr(), us_threat.as_ptr(), 0usize),
+            (them_acc.as_ptr(), them_threat.as_ptr(), half),
+        ] {
+            let out_ptr = out_base.add(out_offset);
+            for i in 0..(half / 32) {
+                let offset = i * 32;
+                let a0 = _mm256_min_epi16(_mm256_max_epi16(load(acc, thr, offset), zero), max127);
+                let b0 =
+                    _mm256_min_epi16(_mm256_max_epi16(load(acc, thr, half + offset), zero), max127);
+                let shifted0 = _mm256_srli_epi16(_mm256_mullo_epi16(a0, b0), 7);
+                let a1 =
+                    _mm256_min_epi16(_mm256_max_epi16(load(acc, thr, offset + 16), zero), max127);
+                let b1 = _mm256_min_epi16(
+                    _mm256_max_epi16(load(acc, thr, half + offset + 16), zero),
+                    max127,
+                );
+                let shifted1 = _mm256_srli_epi16(_mm256_mullo_epi16(a1, b1), 7);
+                let packed = _mm256_packus_epi16(shifted0, shifted1);
+                let fixed = _mm256_permute4x64_epi64(packed, 0xD8);
+                _mm256_storeu_si256(out_ptr.add(offset) as *mut __m256i, fixed);
+            }
+        }
+        output.assume_init()
+    }
+}
+
 /// # Safety
 /// output は L1 バイトを書き込める領域で、入力領域と重ならないこと。
 /// 入力のアライメントは要求せず、出力の既存値は読み取らない。
@@ -1043,6 +1106,43 @@ pub fn compute_king_ranks(
 #[cfg(test)]
 mod tests {
     #[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
+    /// Threat を合成しながら変換した結果が、合成してから変換した結果と一致する。
+    /// i16 の wrapping 和になる境界値も含める。
+    #[cfg(all(
+        feature = "nnue-threat",
+        target_arch = "x86_64",
+        target_feature = "avx2",
+        not(all(target_feature = "avx512f", target_feature = "avx512bw"))
+    ))]
+    #[test]
+    fn sqr_clipped_relu_with_threat_matches_combined() {
+        use super::{Aligned, sqr_clipped_relu_new, sqr_clipped_relu_new_with_threat};
+        use rand::{Rng, SeedableRng};
+        let mut rng = rand_xoshiro::Xoshiro256PlusPlus::seed_from_u64(0x7e7a_c0de);
+        let mut acc = [Aligned([0i16; 1536]), Aligned([0i16; 1536])];
+        let mut thr = [Aligned([0i16; 1536]), Aligned([0i16; 1536])];
+        for round in 0..64 {
+            for a in acc.iter_mut().chain(thr.iter_mut()) {
+                for v in a.0.iter_mut() {
+                    *v = if round % 8 == 0 {
+                        rng.random_range(i16::MIN..=i16::MAX)
+                    } else {
+                        rng.random_range(-300..300)
+                    };
+                }
+            }
+            acc[0].0[0] = i16::MAX;
+            thr[0].0[0] = 1;
+            let combined: [Aligned<[i16; 1536]>; 2] = std::array::from_fn(|p| {
+                Aligned(std::array::from_fn(|i| acc[p].0[i].wrapping_add(thr[p].0[i])))
+            });
+            let expected = sqr_clipped_relu_new(&combined[0].0, &combined[1].0);
+            let actual =
+                sqr_clipped_relu_new_with_threat(&acc[0].0, &thr[0].0, &acc[1].0, &thr[1].0);
+            assert_eq!(actual.0, expected.0, "round {round}");
+        }
+    }
+
     #[test]
     fn fused_output_rejects_short_weights() {
         let mut bucket = super::LayerStackBucket::<64, 16, 30, 32>::new();
