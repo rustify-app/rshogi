@@ -835,6 +835,48 @@ pub(crate) fn sqr_clipped_relu_new_with_threat<const L1: usize>(
     }
 }
 
+/// TEMP(計測用): 駒の累積値に Threat の重み行 (i8) をその場で足しながら変換する。
+#[cfg(all(feature = "nnue-threat", target_arch = "x86_64", target_feature = "avx2"))]
+pub(crate) fn sqr_clipped_relu_new_with_rows<const L1: usize>(
+    us_acc: &[i16; L1],
+    us_rows: &[*const i8],
+    them_acc: &[i16; L1],
+    them_rows: &[*const i8],
+) -> Aligned<[u8; L1]> {
+    const { assert!(L1.is_multiple_of(64)) };
+    let half = L1 / 2;
+    let mut output = std::mem::MaybeUninit::<Aligned<[u8; L1]>>::uninit();
+    unsafe {
+        use std::arch::x86_64::*;
+        let out_base = output.as_mut_ptr().cast::<u8>();
+        let zero = _mm256_setzero_si256();
+        let max127 = _mm256_set1_epi16(127);
+        let load = |p: *const i16, rows: &[*const i8], o: usize| {
+            let mut v = _mm256_loadu_si256(p.add(o) as *const __m256i);
+            for &r in rows {
+                v = _mm256_add_epi16(v, _mm256_cvtepi8_epi16(_mm_loadu_si128(r.add(o) as *const __m128i)));
+            }
+            v
+        };
+        for (acc, rows, out_offset) in [(us_acc.as_ptr(), us_rows, 0usize), (them_acc.as_ptr(), them_rows, half)] {
+            let out_ptr = out_base.add(out_offset);
+            for i in 0..(half / 32) {
+                let offset = i * 32;
+                let a0 = _mm256_min_epi16(_mm256_max_epi16(load(acc, rows, offset), zero), max127);
+                let b0 = _mm256_min_epi16(_mm256_max_epi16(load(acc, rows, half + offset), zero), max127);
+                let shifted0 = _mm256_srli_epi16(_mm256_mullo_epi16(a0, b0), 7);
+                let a1 = _mm256_min_epi16(_mm256_max_epi16(load(acc, rows, offset + 16), zero), max127);
+                let b1 = _mm256_min_epi16(_mm256_max_epi16(load(acc, rows, half + offset + 16), zero), max127);
+                let shifted1 = _mm256_srli_epi16(_mm256_mullo_epi16(a1, b1), 7);
+                let packed = _mm256_packus_epi16(shifted0, shifted1);
+                let fixed = _mm256_permute4x64_epi64(packed, 0xD8);
+                _mm256_storeu_si256(out_ptr.add(offset) as *mut __m256i, fixed);
+            }
+        }
+        output.assume_init()
+    }
+}
+
 /// # Safety
 /// output は L1 バイトを書き込める領域で、入力領域と重ならないこと。
 /// 入力のアライメントは要求せず、出力の既存値は読み取らない。

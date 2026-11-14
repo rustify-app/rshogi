@@ -5,6 +5,9 @@
 //! FT 軸は `LsFeatureSpec` trait + `PhantomData<FT>` で type level に表現し、
 //! monomorphization で既存 HalfKaHmMerged 専用実装と bit-identical な機械語を得る。
 
+/// TEMP(計測用): Threat を累積値で持たず評価時に直接足す
+pub(crate) const DIRECT_THREAT: bool = true;
+
 use super::accumulator::{Aligned, AlignedBox, WeightBox};
 use super::accumulator::{DirtyPiece, IndexList, MAX_ACTIVE_FEATURES, MAX_CHANGED_FEATURES};
 use super::accumulator_layer_stacks::{
@@ -568,7 +571,7 @@ impl<const L1: usize, FT: LsFeatureSpec> FeatureTransformerLayerStacks<L1, FT> {
     /// Threat 重みの行を取得（i8[L1]）
     #[cfg(feature = "nnue-threat")]
     #[inline]
-    fn threat_weight_row(&self, index: usize) -> &[i8] {
+    pub(crate) fn threat_weight_row(&self, index: usize) -> &[i8] {
         let offset = index * L1;
         let end = offset + L1;
         debug_assert!(end <= self.threat_weights.len(), "threat index out of range: {index}");
@@ -581,7 +584,7 @@ impl<const L1: usize, FT: LsFeatureSpec> FeatureTransformerLayerStacks<L1, FT> {
     /// AVX2: `_mm256_cvtepi8_epi16` で 16 要素ずつ変換 + `_mm256_add_epi16`。
     #[cfg(feature = "nnue-threat")]
     #[inline]
-    fn add_threat_weights(&self, accumulation: &mut [i16; L1], index: usize) {
+    pub(crate) fn add_threat_weights(&self, accumulation: &mut [i16; L1], index: usize) {
         // AVX2 ループは `L1 / 16` 回で全要素を処理する前提のため、
         // L1 が 16 の倍数でない場合は monomorphization 時に弾く。
         const {
@@ -772,7 +775,7 @@ impl<const L1: usize, FT: LsFeatureSpec> FeatureTransformerLayerStacks<L1, FT> {
 
             // Threat アキュムレータ（bias なし: piece FT と bias を共有）
             #[cfg(feature = "nnue-threat")]
-            if self.has_threat {
+            if self.has_threat && !DIRECT_THREAT {
                 let king_sq = pos.king_square(perspective);
                 let threat_acc = acc.get_threat_mut(p);
                 threat_acc.fill(0);
@@ -873,7 +876,7 @@ impl<const L1: usize, FT: LsFeatureSpec> FeatureTransformerLayerStacks<L1, FT> {
             // 差分更新で正しく計算できる。HalfKaSplit 用の `reset = king_moved` を流用
             // せず、Threat 専用の `needs_threat_refresh` を使う。
             #[cfg(feature = "nnue-threat")]
-            if self.has_threat {
+            if self.has_threat && !DIRECT_THREAT {
                 let king_sq = pos.king_square(perspective);
                 let reset_threat =
                     threat_features::needs_threat_refresh(dirty_piece, king_sq, perspective);
@@ -1032,7 +1035,7 @@ impl<const L1: usize, FT: LsFeatureSpec> FeatureTransformerLayerStacks<L1, FT> {
             // `needs_threat_refresh` (is_hm_mirror 境界跨ぎのみ true) を使う。
             // 詳細: `threat_features::needs_threat_refresh` doc 参照。
             #[cfg(feature = "nnue-threat")]
-            if self.has_threat {
+            if self.has_threat && !DIRECT_THREAT {
                 let king_sq = pos.king_square(perspective);
                 let reset_threat =
                     threat_features::needs_threat_refresh(dirty_piece, king_sq, perspective);
@@ -1114,7 +1117,7 @@ impl<const L1: usize, FT: LsFeatureSpec> FeatureTransformerLayerStacks<L1, FT> {
         }
 
         #[cfg(feature = "nnue-threat")]
-        if self.has_threat {
+        if self.has_threat && !DIRECT_THREAT {
             use super::accumulator_layer_stacks::MAX_CACHED_THREAT_INDICES;
             let mut lists = [[0u32; MAX_CACHED_THREAT_INDICES]; 2];
             let mut lens = [0usize; 2];
@@ -1353,7 +1356,7 @@ impl<const L1: usize, FT: LsFeatureSpec> FeatureTransformerLayerStacks<L1, FT> {
                     current_acc.psqt_accumulation[p] = source_acc.psqt_accumulation[p];
                 }
                 #[cfg(feature = "nnue-threat")]
-                if self.has_threat {
+                if self.has_threat && !DIRECT_THREAT {
                     current_acc.get_threat_mut(p).copy_from_slice(source_acc.get_threat(p));
                 }
             }
@@ -1414,7 +1417,7 @@ impl<const L1: usize, FT: LsFeatureSpec> FeatureTransformerLayerStacks<L1, FT> {
         // Threat: パス長 1 なら pos が正しい after-state なので差分更新可能。
         // パス長 2+ では中間局面を再構成できないため full refresh。
         #[cfg(feature = "nnue-threat")]
-        if self.has_threat {
+        if self.has_threat && !DIRECT_THREAT {
             if path.len() == 1 {
                 // 1 ply: pos が正しい after-state なので差分更新可能
                 let entry_idx = path.iter().next().unwrap();

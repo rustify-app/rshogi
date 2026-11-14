@@ -732,6 +732,48 @@ impl<
         })
     }
 
+    #[inline]
+    fn transform_accumulators_direct(
+        &self,
+        pos: &Position,
+        acc: &AccumulatorLayerStacks<L1>,
+        side_to_move: Color,
+    ) -> Aligned<[u8; L1]> {
+        if self.feature_transformer.has_threat {
+            const CAP: usize = 64;
+            let mut rows = [[std::ptr::null::<i8>(); CAP]; 2];
+            let mut lens = [0usize; 2];
+            super::threat_features::for_each_active_threat_index_both(pos, |c, idx| {
+                let p = c as usize;
+                if lens[p] < CAP {
+                    rows[p][lens[p]] = self.feature_transformer.threat_weight_row(idx).as_ptr();
+                }
+                lens[p] += 1;
+            });
+            if lens[0] <= CAP && lens[1] <= CAP {
+                let (us, them) = if side_to_move == Color::Black { (0, 1) } else { (1, 0) };
+                return super::layer_stacks::sqr_clipped_relu_new_with_rows(
+                    acc.get(us),
+                    &rows[us][..lens[us]],
+                    acc.get(them),
+                    &rows[them][..lens[them]],
+                );
+            }
+            let mut t = [Aligned([0i16; L1]), Aligned([0i16; L1])];
+            super::threat_features::for_each_active_threat_index_both(pos, |c, idx| {
+                self.feature_transformer.add_threat_weights(&mut t[c as usize].0, idx);
+            });
+            let (us, them) = if side_to_move == Color::Black { (0, 1) } else { (1, 0) };
+            return super::layer_stacks::sqr_clipped_relu_new_with_threat(
+                acc.get(us),
+                &t[us].0,
+                acc.get(them),
+                &t[them].0,
+            );
+        }
+        self.transform_accumulators(acc, side_to_move)
+    }
+
     /// forward と同じ因子・入力から活性飽和数を計測する。
     ///
     /// 戻り値は両視点の FT 因子が 127 以上となる数（総数は 2 * L1）。
@@ -786,7 +828,7 @@ impl<
             target_feature = "avx512vnni"
         )))]
         let raw_score = {
-            let transformed = self.transform_accumulators(acc, side_to_move);
+            let transformed = self.transform_accumulators_direct(pos, acc, side_to_move);
             self.layer_stacks.evaluate_raw(bucket_index, &transformed.0)
         };
 
